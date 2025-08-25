@@ -1,0 +1,195 @@
+version: '3.8'
+
+services:
+  # PostgreSQL con TimescaleDB extension
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: fluxion_postgres
+    environment:
+      POSTGRES_DB: fluxion_dev
+      POSTGRES_USER: fluxion_user
+      POSTGRES_PASSWORD: fluxion_pass
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - fluxion-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluxion_user -d fluxion_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis para cache y sessions
+  redis:
+    image: redis:7-alpine
+    container_name: fluxion_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - fluxion-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Google Pub/Sub Emulator
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:alpine
+    container_name: fluxion_pubsub
+    command: >
+      sh -c "gcloud config set project fluxion-ai-dev --quiet &&
+             gcloud beta emulators pubsub start --host-port=0.0.0.0:8085 --data-dir=/data --quiet"
+    ports:
+      - "8085:8085"
+    volumes:
+      - pubsub_data:/data
+    networks:
+      - fluxion-network
+    environment:
+      CLOUDSDK_CORE_PROJECT: fluxion-ai-dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Backend Service (Node.js + TypeScript)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/Dockerfile.backend
+    container_name: fluxion_backend
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://fluxion_user:fluxion_pass@postgres:5432/fluxion_dev
+      REDIS_URL: redis://redis:6379
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      GOOGLE_CLOUD_PROJECT: fluxion-ai-dev
+      JWT_SECRET: dev_jwt_secret_change_in_production
+      AI_ENGINE_URL: http://ai-engine:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    networks:
+      - fluxion-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pubsub-emulator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./backend/src
+          target: /app/src
+        - action: rebuild
+          path: ./backend/package.json
+
+  # AI Engine Service (Python + FastAPI)
+  ai-engine:
+    build:
+      context: ./ai-engine
+      dockerfile: ../docker/Dockerfile.ai-engine
+    container_name: fluxion_ai_engine
+    environment:
+      PYTHONPATH: /app/src
+      ENVIRONMENT: development
+      REDIS_URL: redis://redis:6379
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      GOOGLE_CLOUD_PROJECT: fluxion-ai-dev
+      DATABASE_URL: postgresql://fluxion_user:fluxion_pass@postgres:5432/fluxion_dev
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ai-engine:/app
+    networks:
+      - fluxion-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pubsub-emulator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./ai-engine/src
+          target: /app/src
+
+  # Frontend Service (React + TypeScript)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    container_name: fluxion_frontend
+    environment:
+      NODE_ENV: development
+      REACT_APP_API_URL: http://localhost:3000
+      REACT_APP_WS_URL: ws://localhost:3000
+      CHOKIDAR_USEPOLLING: true
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - fluxion-network
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./frontend/src
+          target: /app/src
+        - action: rebuild
+          path: ./frontend/package.json
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  pubsub_data:
+    driver: local
+
+networks:
+  fluxion-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

@@ -1,0 +1,125 @@
+# =============================================================================
+# FLUXION AI - FRONTEND DOCKERFILE
+# React + TypeScript + Tailwind CSS
+# =============================================================================
+
+# Base image
+FROM node:20-alpine AS base
+
+# Install system dependencies
+RUN apk add --no-cache \
+    curl \
+    ca-certificates \
+    && rm -rf /var/cache/apk/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# =============================================================================
+# DEVELOPMENT STAGE
+# =============================================================================
+FROM base AS development
+
+# Install all dependencies (including dev dependencies)
+RUN npm ci
+
+# Copy source code
+COPY src/ ./src/
+COPY public/ ./public/
+COPY tsconfig.json ./
+COPY tailwind.config.js* ./
+COPY postcss.config.js* ./
+COPY vite.config.ts* ./
+COPY index.html ./
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Change ownership
+RUN chown -R nodejs:nodejs /app
+USER nodejs
+
+# Expose port
+EXPOSE 3001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3001 || exit 1
+
+# Start development server
+CMD ["npm", "run", "dev"]
+
+# =============================================================================
+# BUILDER STAGE
+# =============================================================================
+FROM base AS builder
+
+# Set build environment
+ENV NODE_ENV=production
+
+# Install all dependencies
+RUN npm ci --include=dev
+
+# Copy source code
+COPY src/ ./src/
+COPY public/ ./public/
+COPY tsconfig.json ./
+COPY tailwind.config.js* ./
+COPY postcss.config.js* ./
+COPY vite.config.ts* ./
+COPY index.html ./
+
+# Build application
+RUN npm run build
+
+# =============================================================================
+# PRODUCTION STAGE
+# =============================================================================
+FROM nginx:alpine AS production
+
+# Install additional tools
+RUN apk add --no-cache \
+    curl \
+    && rm -rf /var/cache/apk/*
+
+# Copy built application
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Copy nginx configuration
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+
+# Create non-root user for nginx
+RUN addgroup -g 1001 -S nginx-user && \
+    adduser -S nginx-user -u 1001 -G nginx-user
+
+# Set proper permissions
+RUN chown -R nginx-user:nginx-user /usr/share/nginx/html && \
+    chown -R nginx-user:nginx-user /var/cache/nginx && \
+    chown -R nginx-user:nginx-user /var/log/nginx && \
+    chown -R nginx-user:nginx-user /etc/nginx/conf.d
+
+# Create pid file directory
+RUN mkdir -p /var/run && \
+    chown nginx-user:nginx-user /var/run
+
+# Switch to non-root user
+USER nginx-user
+
+# Expose port
+EXPOSE 80
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:80 || exit 1
+
+# Start nginx
+CMD ["nginx", "-g", "daemon off;"]
+
+# Labels for metadata
+LABEL maintainer="Fluxion AI Team <dev@fluxion.ai>"
+LABEL version="1.0.0"
+LABEL description="Fluxion AI Frontend Service"
